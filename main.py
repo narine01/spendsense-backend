@@ -19,7 +19,7 @@ client = genai.Client(
 )
 APP_TOKEN = os.environ["APP_TOKEN"]  # must be set locally (.env) and on Render
 
-MODEL = "gemini-2.5-flash"
+MODEL = os.environ.get("GEMINI_MODEL", "gemini-2.5-flash")
 MAX_FILE_BYTES = 5_000_000
 MAX_EXPENSES = 300
 ALLOWED_TYPES = {"image/jpeg", "image/png", "image/webp", "application/pdf"}
@@ -57,7 +57,8 @@ def call_gemini(**kwargs):
         except errors.APIError as e:
             last = e
             log.warning("Gemini API error %s: %s", e.code, e.message)
-            if e.code in (429, 500, 503) and attempt < 2:
+            # Never retry 429: a quota error will not clear in a few seconds.
+            if e.code in (500, 503) and attempt < 2:
                 time.sleep(2 * (attempt + 1))
                 continue
             break
