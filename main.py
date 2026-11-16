@@ -1,3 +1,4 @@
+import logging
 import os
 import secrets
 import time
@@ -6,10 +7,11 @@ from collections import defaultdict, deque
 from dotenv import load_dotenv
 from fastapi import Depends, FastAPI, File, Header, HTTPException, Request, UploadFile
 from google import genai
-from google.genai import types
+from google.genai import errors, types
 from pydantic import BaseModel
 
 load_dotenv()
+log = logging.getLogger("uvicorn.error")
 
 client = genai.Client(
     api_key=os.environ["GEMINI_API_KEY"],
@@ -43,6 +45,29 @@ def protect(request: Request, x_app_token: str = Header(default="")):
     if len(window) >= RATE_LIMIT:
         raise HTTPException(status_code=429, detail="Too many requests, slow down")
     window.append(now)
+
+
+def call_gemini(**kwargs):
+    """Call Gemini, retrying briefly on transient errors (429 / 5xx).
+    Always logs the real cause, and turns failures into clean HTTP errors."""
+    last = None
+    for attempt in range(3):
+        try:
+            return client.models.generate_content(**kwargs)
+        except errors.APIError as e:
+            last = e
+            log.warning("Gemini API error %s: %s", e.code, e.message)
+            if e.code in (429, 500, 503) and attempt < 2:
+                time.sleep(2 * (attempt + 1))
+                continue
+            break
+        except Exception:
+            log.exception("Unexpected error calling Gemini")
+            raise HTTPException(status_code=502, detail="AI service failed")
+
+    if last is not None and last.code == 429:
+        raise HTTPException(status_code=429, detail="AI is busy right now, try again in a minute")
+    raise HTTPException(status_code=502, detail="AI service failed")
 
 
 app = FastAPI()
@@ -91,17 +116,14 @@ def health():
 def parse_expense(req: ParseRequest):
     if not req.text.strip():
         raise HTTPException(status_code=400, detail="Text is empty")
-    try:
-        response = client.models.generate_content(
-            model=MODEL,
-            contents=f"Extract the expense from this text: {req.text}",
-            config={
-                "response_mime_type": "application/json",
-                "response_schema": ParsedExpense,
-            },
-        )
-    except Exception:
-        raise HTTPException(status_code=502, detail="AI service failed")
+    response = call_gemini(
+        model=MODEL,
+        contents=f"Extract the expense from this text: {req.text}",
+        config={
+            "response_mime_type": "application/json",
+            "response_schema": ParsedExpense,
+        },
+    )
     return response.parsed
 
 
@@ -114,22 +136,19 @@ def scan_bill(file: UploadFile = File(...)):
     if len(data) > MAX_FILE_BYTES:
         raise HTTPException(status_code=413, detail="File too large")
 
-    try:
-        response = client.models.generate_content(
-            model=MODEL,
-            contents=[
-                types.Part.from_bytes(data=data, mime_type=file.content_type),
-                "Read this bill. Return the merchant name, the total amount in rupees, "
-                "the date as YYYY-MM-DD (empty string if not visible), and one category "
-                "from: Food, Transport, Groceries, Bills, Entertainment, Shopping, Health, Other.",
-            ],
-            config={
-                "response_mime_type": "application/json",
-                "response_schema": ScannedBill,
-            },
-        )
-    except Exception:
-        raise HTTPException(status_code=502, detail="AI service failed")
+    response = call_gemini(
+        model=MODEL,
+        contents=[
+            types.Part.from_bytes(data=data, mime_type=file.content_type),
+            "Read this bill. Return the merchant name, the total amount in rupees, "
+            "the date as YYYY-MM-DD (empty string if not visible), and one category "
+            "from: Food, Transport, Groceries, Bills, Entertainment, Shopping, Health, Other.",
+        ],
+        config={
+            "response_mime_type": "application/json",
+            "response_schema": ScannedBill,
+        },
+    )
     return response.parsed
 
 
@@ -160,8 +179,5 @@ def ask(req: AskRequest):
         f"Question: {req.question}"
     )
 
-    try:
-        response = client.models.generate_content(model=MODEL, contents=prompt)
-    except Exception:
-        raise HTTPException(status_code=502, detail="AI service failed")
+    response = call_gemini(model=MODEL, contents=prompt)
     return AskResponse(answer=(response.text or "").strip() or "I couldn't come up with an answer.")
