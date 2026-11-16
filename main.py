@@ -1,7 +1,10 @@
 import os
+import secrets
+import time
+from collections import defaultdict, deque
 
 from dotenv import load_dotenv
-from fastapi import FastAPI, File, HTTPException, UploadFile
+from fastapi import Depends, FastAPI, File, Header, HTTPException, Request, UploadFile
 from google import genai
 from google.genai import types
 from pydantic import BaseModel
@@ -12,11 +15,35 @@ client = genai.Client(
     api_key=os.environ["GEMINI_API_KEY"],
     http_options=types.HttpOptions(api_version="v1beta"),
 )
+APP_TOKEN = os.environ["APP_TOKEN"]  # must be set locally (.env) and on Render
 
 MODEL = "gemini-2.5-flash"
 MAX_FILE_BYTES = 5_000_000
 MAX_EXPENSES = 300
 ALLOWED_TYPES = {"image/jpeg", "image/png", "image/webp", "application/pdf"}
+
+RATE_LIMIT = 20  # requests
+RATE_WINDOW = 60  # seconds
+_hits: dict[str, deque] = defaultdict(deque)
+
+
+def protect(request: Request, x_app_token: str = Header(default="")):
+    # 1) token check (constant-time compare)
+    if not secrets.compare_digest(x_app_token, APP_TOKEN):
+        raise HTTPException(status_code=401, detail="Unauthorized")
+
+    # 2) simple in-memory rate limit per client IP.
+    # Render puts the real client IP in X-Forwarded-For.
+    forwarded = request.headers.get("x-forwarded-for", "")
+    ip = forwarded.split(",")[0].strip() or (request.client.host if request.client else "unknown")
+    now = time.monotonic()
+    window = _hits[ip]
+    while window and now - window[0] > RATE_WINDOW:
+        window.popleft()
+    if len(window) >= RATE_LIMIT:
+        raise HTTPException(status_code=429, detail="Too many requests, slow down")
+    window.append(now)
+
 
 app = FastAPI()
 
@@ -47,7 +74,7 @@ class ExpenseItem(BaseModel):
 
 class AskRequest(BaseModel):
     question: str
-    today: str  # YYYY-MM-DD, so "this month" / "last month" make sense
+    today: str
     expenses: list[ExpenseItem]
 
 
@@ -55,7 +82,12 @@ class AskResponse(BaseModel):
     answer: str
 
 
-@app.post("/parse-expense", response_model=ParsedExpense)
+@app.get("/health")
+def health():
+    return {"status": "ok"}  # open on purpose: no AI call, no data
+
+
+@app.post("/parse-expense", response_model=ParsedExpense, dependencies=[Depends(protect)])
 def parse_expense(req: ParseRequest):
     if not req.text.strip():
         raise HTTPException(status_code=400, detail="Text is empty")
@@ -73,7 +105,7 @@ def parse_expense(req: ParseRequest):
     return response.parsed
 
 
-@app.post("/scan-bill", response_model=ScannedBill)
+@app.post("/scan-bill", response_model=ScannedBill, dependencies=[Depends(protect)])
 def scan_bill(file: UploadFile = File(...)):
     if file.content_type not in ALLOWED_TYPES:
         raise HTTPException(status_code=415, detail="Unsupported file type")
@@ -101,7 +133,7 @@ def scan_bill(file: UploadFile = File(...)):
     return response.parsed
 
 
-@app.post("/ask", response_model=AskResponse)
+@app.post("/ask", response_model=AskResponse, dependencies=[Depends(protect)])
 def ask(req: AskRequest):
     if not req.question.strip():
         raise HTTPException(status_code=400, detail="Question is empty")
