@@ -70,10 +70,14 @@ def _firebase_admin_app():
 
 def _valid_app_check(token: str) -> bool:
     if not token:
+        log.info("Firebase App Check token missing")
         return False
     try:
         claims = app_check.verify_token(token, app=_firebase_admin_app())
-        return not FIREBASE_APP_ID or claims.get("sub") == FIREBASE_APP_ID
+        if FIREBASE_APP_ID and claims.get("sub") != FIREBASE_APP_ID:
+            log.info("Firebase App Check token verified but app ID did not match")
+            return False
+        return True
     except Exception as exc:
         # Never log the bearer token; record only the exception class.
         log.info("Firebase App Check verification failed (%s)", type(exc).__name__)
