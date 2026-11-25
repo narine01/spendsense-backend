@@ -87,7 +87,7 @@ def _valid_app_check(token: str) -> bool:
 def protect(
     request: Request,
     x_app_token: str = Header(default=""),
-    x_firebase_app_check: str = Header(default=""),
+    x_firebase_app_check: str = Header(default="", alias="X-Firebase-AppCheck"),
 ):
     # During rollout, continue accepting the existing token while also checking
     # App Check. Once Render is configured, APP_CHECK_ENFORCED=true disables the
