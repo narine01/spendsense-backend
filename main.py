@@ -8,6 +8,8 @@ from collections import defaultdict, deque
 from dotenv import load_dotenv
 from fastapi import Depends, FastAPI, File, Header, HTTPException, Request, UploadFile
 from fastapi.responses import StreamingResponse
+import firebase_admin
+from firebase_admin import app_check, credentials
 from google import genai
 from google.genai import errors, types
 
@@ -27,7 +29,12 @@ client = genai.Client(
     api_key=os.environ["GEMINI_API_KEY"],
     http_options=types.HttpOptions(api_version="v1beta"),
 )
-APP_TOKEN = os.environ["APP_TOKEN"]  # must be set locally (.env) and on Render
+APP_TOKEN = os.environ.get("APP_TOKEN", "")  # legacy fallback during App Check rollout
+FIREBASE_PROJECT_ID = os.environ.get("FIREBASE_PROJECT_ID", "")
+FIREBASE_APP_ID = os.environ.get("FIREBASE_APP_ID", "")
+APP_CHECK_ENFORCED = os.environ.get("APP_CHECK_ENFORCED", "false").lower() == "true"
+FIREBASE_SERVICE_ACCOUNT_JSON = os.environ.get("FIREBASE_SERVICE_ACCOUNT_JSON", "")
+_firebase_app = None
 
 # Gemini 2.5 models are "legacy" now (Google recommends newer models for new projects).
 # Set GEMINI_MODEL on Render to switch without a code change, and check your limits at
@@ -45,12 +52,50 @@ RATE_WINDOW = 60  # seconds
 _hits: dict[str, deque] = defaultdict(deque)
 
 
-def protect(request: Request, x_app_token: str = Header(default="")):
-    # 1) token check (constant-time compare)
-    if not secrets.compare_digest(x_app_token, APP_TOKEN):
-        raise HTTPException(status_code=401, detail="Unauthorized")
+def _firebase_admin_app():
+    global _firebase_app
+    if _firebase_app is None:
+        if not FIREBASE_PROJECT_ID:
+            raise RuntimeError("FIREBASE_PROJECT_ID is required when App Check is enabled")
+        if FIREBASE_SERVICE_ACCOUNT_JSON:
+            credential = credentials.Certificate(json.loads(FIREBASE_SERVICE_ACCOUNT_JSON))
+        else:
+            # Supports Render secret files via GOOGLE_APPLICATION_CREDENTIALS.
+            credential = credentials.ApplicationDefault()
+        _firebase_app = firebase_admin.initialize_app(
+            credential, options={"projectId": FIREBASE_PROJECT_ID}, name="spendsense-app-check"
+        )
+    return _firebase_app
 
-    # 2) simple in-memory rate limit per client IP.
+
+def _valid_app_check(token: str) -> bool:
+    if not token:
+        return False
+    try:
+        claims = app_check.verify_token(token, app=_firebase_admin_app())
+        return not FIREBASE_APP_ID or claims.get("sub") == FIREBASE_APP_ID
+    except Exception as exc:
+        # Never log the bearer token; record only the exception class.
+        log.info("Firebase App Check verification failed (%s)", type(exc).__name__)
+        return False
+
+
+def protect(
+    request: Request,
+    x_app_token: str = Header(default=""),
+    x_firebase_app_check: str = Header(default=""),
+):
+    # During rollout, continue accepting the existing token while also checking
+    # App Check. Once Render is configured, APP_CHECK_ENFORCED=true disables the
+    # legacy token path and makes App Check mandatory.
+    if APP_CHECK_ENFORCED:
+        if not _valid_app_check(x_firebase_app_check):
+            raise HTTPException(status_code=401, detail="Unauthorized")
+    elif not _valid_app_check(x_firebase_app_check):
+        if not APP_TOKEN or not secrets.compare_digest(x_app_token, APP_TOKEN):
+            raise HTTPException(status_code=401, detail="Unauthorized")
+
+    # Simple in-memory rate limit per client IP.
     # Render puts the real client IP in X-Forwarded-For.
     forwarded = request.headers.get("x-forwarded-for", "")
     ip = forwarded.split(",")[0].strip() or (request.client.host if request.client else "unknown")
